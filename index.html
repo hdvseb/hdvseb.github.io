@@ -9,14 +9,61 @@
     <link rel="preconnect" href="https://script.google.com" crossorigin="anonymous"/>
     <link rel="preconnect" href="https://script.googleusercontent.com" crossorigin="anonymous"/>
 
-   
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background-color: #f8f9fa;
+        font-family: sans-serif;
+      }
+
+      /* Tela de Carregamento */
+      #loader {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        z-index: 10;
+      }
+
+      .spinner {
+        border: 4px solid #f3f3f3;
+        border-top: 4px solid #3498db;
+        border-radius: 50%;
+        width: 40px;
+        height: 40px;
+        animation: spin 1s linear infinite;
+      }
+
+      @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+      }
+
+      #custom-iframe {
+        width: 100%;
+        height: 100vh;
+        border: none;
+        display: block;
+        opacity: 0;
+        transition: opacity 0.3s ease;
+      }
+    </style>
 </head>
 <body>
+
 
   <iframe 
     id="custom-iframe" 
     src="https://script.google.com/macros/s/AKfycbxWd5Koielaa9VtbgYzMuBYIVPen8NFBlJMS3_52QY1U0nZXUCo1Qk7O8g7ezJiNRmHbA/exec" 
-    title=Gerenciador de Documentos"
+    title="Vagas Click"
     onload="document.getElementById('loader').style.display='none'; this.style.opacity='1';">
   </iframe>
 
