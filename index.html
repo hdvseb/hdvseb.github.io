@@ -559,7 +559,7 @@ const BUILD_ID = 'SGD-GITHUB-V44-LOGIN-POST-LOGO-CONFIG';
 // outro lugar deste arquivo (nem em comentários, nem dentro de textos) —
 // o HtmlService varre o arquivo INTEIRO à procura delas, e uma ocorrência
 // perdida vira um "SyntaxError: Invalid or unexpected token" ao publicar.
-const DEFAULT_GAS_URL = 'https://script.google.com/macros/s/AKfycbxWd5Koielaa9VtbgYzMuBYIVPen8NFBlJMS3_52QY1U0nZXUCo1Qk7O8g7ezJiNRmHbA/exec';
+const DEFAULT_GAS_URL = '<?= ScriptApp.getService().getUrl() ?>';
 const RPC_DISPONIVEL = !!DEFAULT_GAS_URL;
 // REMOÇÃO (item 10): a busca automática de GAS_URL na aba "Settings" via
 // exportação CSV pública (gviz/tq) foi removida. Ela dependia da planilha
@@ -1060,6 +1060,19 @@ let jsonpSeq = 0;
  * payload pode conter base64 e não deve ser colocado na URL.
  */
 function gasCall_(fn,args,timeoutMs){
+
+  if (typeof google !== 'undefined' && google.script && google.script.run) {
+    return new Promise((resolve, reject) => {
+      google.script.run
+        .withSuccessHandler(function(res) {
+          resolve(res);
+        })
+        .withFailureHandler(function(err) {
+          reject(new Error(err && err.message ? err.message : 'Erro na chamada'));
+        })
+        .executarApiFn(fn, args || []);
+    });
+  }
   args=args||[];
   if(!DEFAULT_GAS_URL) return Promise.reject(new Error('URL do Apps Script não configurada.'));
   return new Promise((resolve,reject)=>{
@@ -1089,29 +1102,21 @@ function gasCall_(fn,args,timeoutMs){
     document.head.appendChild(script);
   });
 }
-/* V36: RPC POST generico para autenticacao. Os dados do login ficam no
-   corpo HTTPS e nao na URL; nao depende de JSONP para autenticar. */
-function postApiCall_(fn,args,timeoutMs){
-  if(!DEFAULT_GAS_URL) return Promise.reject(new Error('URL do Apps Script nao configurada.'));
-  return new Promise((resolve,reject)=>{
-    const id='postrpc_'+Date.now()+'_'+(++jsonpSeq);
-    const iframe=document.createElement('iframe'); iframe.name=id; iframe.id=id; iframe.style.display='none';
-    iframe.setAttribute('aria-hidden','true'); document.body.appendChild(iframe);
-    const form=document.createElement('form'); form.method='POST'; form.action=DEFAULT_GAS_URL; form.target=id; form.style.display='none';
-    const input=document.createElement('textarea'); input.name='payload';
-    input.value=JSON.stringify({fn:fn,args:Array.isArray(args)?args:[],requestId:id}); input.style.display='none';
-    form.appendChild(input); document.body.appendChild(form);
-    let done=false;
-    const timer=setTimeout(()=>finish(new Error('Tempo esgotado ao comunicar com o Apps Script. Verifique a implantacao /exec.')),Number(timeoutMs||30000));
-    function finish(err,data){ if(done)return; done=true; clearTimeout(timer); window.removeEventListener('message',onMessage); try{form.remove();iframe.remove();}catch(e){} if(err)reject(err);else resolve(data); }
-    function onMessage(ev){ const d=ev&&ev.data; if(!d||d.type!=='hddocs-api-result'||d.id!==id)return; finish(null,d.data); }
-    window.addEventListener('message',onMessage);
-    try{form.submit();}catch(e){finish(e);}
-  });
-}
+
+
 
 /* POST é reservado exclusivamente para upload de arquivos. */
 function postApi_(payload){
+  if(typeof google !== 'undefined' && google.script && google.script.run){
+    return new Promise((resolve, reject) => {
+      google.script.run
+        .withSuccessHandler(function(res){ resolve(res); })
+        .withFailureHandler(function(err){
+          reject(new Error(err && err.message ? err.message : 'Erro no upload'));
+        })
+        .uploadArquivoViaScriptRun(payload.payload);
+    });
+  }
   if(!DEFAULT_GAS_URL) return Promise.reject(new Error('URL do Apps Script não configurada.'));
   return new Promise((resolve,reject)=>{
     const id='post_'+Date.now()+'_'+(++jsonpSeq);
@@ -1126,28 +1131,7 @@ function postApi_(payload){
     input.name='payload'; input.value=JSON.stringify(payload); input.style.display='none';
     form.appendChild(input); document.body.appendChild(form);
     let done=false;
-    // ITEM (achado real: essa espera nunca pode ser "vencida" de verdade):
-    // este mecanismo escuta por uma mensagem (postMessage) do tipo
-    // "hddocs-api-result" vinda da resposta do servidor — mas o Code.gs
-    // NUNCA envia essa mensagem em lugar nenhum (doPost só devolve JSON
-    // puro via ContentService, sem nenhum script embutido capaz de mandar
-    // uma postMessage de volta). Ou seja: essa promessa só consegue
-    // resolver pelo timeout abaixo, nunca pelo "sucesso" de verdade — os
-    // uploads só pareciam funcionar até agora porque, depois desse timeout
-    // "falso", outras verificações em segundo plano (pull periódico,
-    // verificarUploadConfirmadoNoServidor_) descobriam depois que o
-    // arquivo já tinha subido certo no servidor. Esperar 120 segundos por
-    // uma confirmação que estruturalmente nunca chega era só desperdício
-    // de tempo — reduzido para 30s (a verificação de confirmação real
-    // assume a partir daí).
-    // NOTA: uma tentativa anterior de usar o evento 'load' do iframe para
-    // desistir ainda mais cedo foi revertida — todo iframe recém-criado
-    // sem "src" dispara um 'load' sozinho para a página em branco inicial,
-    // e diferenciar esse load "vazio" do load real (resposta do
-    // formulário) demonstrou ser frágil demais para confiar sem poder
-    // testar ao vivo. Mais vale um timeout simples e previsível.
     const timer=setTimeout(()=>finish(new Error('Tempo esgotado ao enviar o arquivo para o Apps Script.')),30000);
-
     function finish(err,data){
       if(done)return; done=true; clearTimeout(timer); window.removeEventListener('message',onMessage);
       try{form.remove();iframe.remove();}catch(e){}
@@ -1161,7 +1145,8 @@ function postApi_(payload){
     window.addEventListener('message',onMessage);
     try{form.submit();}catch(e){finish(e);}
   });
-}
+} 
+
 function chamarAcaoGet_(params){
   params=params||{};
   if(params.acao==='escanearPendentes'||params.acao==='verificarOrfaos') return gasCall_('apiAction',[Object.assign({},params,{token:session?session.token:''})]);
@@ -1198,8 +1183,8 @@ const filaPush_ = {}; // { folha: [promises em voo, mais antiga primeiro] }
 const PUSH_CONCORRENCIA = 2;
 
 function corpoComUsuario_(extra){ return Object.assign({token:session?session.token:''},extra||{}); }
-const Sync = {
 
+const Sync = {
   url(){ return !!DEFAULT_GAS_URL; },
   push(f,rows,idsAlterados){
     if(!session||!DEFAULT_GAS_URL)return Promise.resolve({ok:false});
@@ -1207,47 +1192,17 @@ const Sync = {
     if(f==='Documentos')out=rows.map(r=>{if(!r.arquivo)return r;const c=Object.assign({},r);delete c.arquivo;return c;});
     const body=corpoComUsuario_({folha:f,rows:out});
     const fila = filaPush_[f] || (filaPush_[f] = []);
-    // Só espera algo se já tiver PUSH_CONCORRENCIA chamadas desta aba em
-    // andamento — nesse caso, espera a MAIS ANTIGA delas (não a mais
-    // recente), o que efetivamente limita quantas rodam ao mesmo tempo
-    // sem serializar tudo numa fila só de um em um.
     const anterior = fila.length >= PUSH_CONCORRENCIA ? fila.shift() : Promise.resolve();
     const idsProtegidos=Array.isArray(idsAlterados)?idsAlterados:[];
     const protegeMoveRace = (f==='Documentos'||f==='Pastas');
-    // CORREÇÃO: apiPush move cada arquivo/pasta alterado no Drive um por um,
-    // sequencialmente, no servidor (ver comentário "BUG 1" acima) — mover
-    // vários itens de uma vez pode facilmente ultrapassar o timeout fixo de
-    // 25s usado para chamadas normais (login, pull, ações simples), mesmo
-    // quando o servidor está processando normalmente e vai terminar segundos
-    // depois. Isso gerava o aviso "Não foi possível confirmar a
-    // sincronização com o Drive agora" só por causa do timeout do lado do
-    // cliente, não por uma falha real. Damos mais tempo proporcional à
-    // quantidade de itens alterados nesse push (25s + 4s por item, até 90s).
     const timeoutPush = protegeMoveRace
       ? Math.min(90000, Math.max(JSONP_TIMEOUT_MS, JSONP_TIMEOUT_MS + idsProtegidos.length*4000))
       : JSONP_TIMEOUT_MS;
-    // ITEM 20: agora devolve uma Promise que resolve com {ok:true/false}
-    // depois que o push (e a proteção/pull relacionados) terminam de ser
-    // tratados — antes essa função não devolvia nada, então quem chamava
-    // (handleUpload em lote, por exemplo) não tinha como saber quando UM
-    // envio realmente terminou antes de começar o próximo. Isso é o que
-    // permite enfileirar os envios em lote um de cada vez, em vez de
-    // disparar todos ao mesmo tempo.
     const p = anterior.then(()=>gasCall_('apiPush',[body],timeoutPush)).then(res=>{
-      // Push confirmado pelo servidor: a partir daqui a resposta já reflete
-      // o estado final (a função apiPush só retorna depois de mover os
-      // arquivos/pastas no Drive), então é seguro liberar a proteção e
-      // buscar o estado real imediatamente, sem esperar o próximo ciclo.
       if(protegeMoveRace && idsProtegidos.length) limparPendenteLocal_(f,idsProtegidos);
       if(protegeMoveRace) agendarPull(true);
       return {ok:true, res:res};
     }).catch(err=>{
-      // Falha/timeout no push: NÃO liberamos a proteção aqui — em caso de
-      // timeout do lado do cliente (JSONP_TIMEOUT_MS), o servidor pode
-      // ainda estar processando o Drive em segundo plano, e um pull
-      // imediato pegaria um estado intermediário. A proteção expira
-      // sozinha (PENDENTE_LOCAL_MS) e o polling de existeMovePendente_
-      // continua tentando convergir com o servidor.
       if(protegeMoveRace){
         toastLimitado_('Não foi possível confirmar a sincronização com o Drive agora. Tentando novamente…', 'error', 'sync-drive-timeout', 6000);
         agendarPull();
@@ -1261,40 +1216,15 @@ const Sync = {
   pushAll(){if(session)FOLHAS.forEach(f=>this.push(f,DB.get(f)));},
   uploadArquivo(payload){
     if(!session||!DEFAULT_GAS_URL)return Promise.reject(new Error('sessão indisponível'));
-    // CORREÇÃO (ver bloco "pendentesLocal_" acima): protege a cópia local
-    // do arquivo (campo "arquivo", base64) contra ser apagada por um pull
-    // que chegue enquanto o envio do conteúdo ainda está em andamento — o
-    // servidor nunca guarda esse campo, então um pull nesse meio-tempo
-    // sobrescreveria a linha local com uma versão sem o backup, e um
-    // eventual "Reenviar" depois de uma falha ficaria sem conteúdo para
-    // reenviar.
     const docId = payload && payload.docId;
     if(docId) marcarPendenteLocal_('Documentos',[docId]);
-    // ITEM 26 (30+ minutos para subir 19 arquivos, contra menos de 1
-    // minuto pelo Google Drive direto): esta chamada, a mais pesada de
-    // todas (é aqui que o arquivo de fato é criado no Drive), ficava
-    // enfileirada atrás de TODOS os envios anteriores do mesmo lote — cada
-    // arquivo só começava a subir depois do anterior ter terminado a
-    // viagem de ida e volta completa ao servidor, um de cada vez, sem
-    // nenhum aproveitamento do tempo de espera de rede. O servidor já
-    // protege a gravação da planilha com um bloqueio (LockService) — não
-    // precisa mais dessa fila do lado do cliente pra isso. Agora a chamada
-    // sai direto; quem limita quantos arquivos sobem ao mesmo tempo é o
-    // "pool" de workers em handleUploadLote (como o Google Drive faz),
-    // não mais uma fila única e serial aqui.
     const pBruta=postApi_({fn:'apiUploadArquivo',payload:corpoComUsuario_(payload)});
     const p=pBruta.then(res=>{
-      // Sucesso: a planilha já tem driveId/erroUpload atualizados (o
-      // endpoint só responde depois de gravar), então já dá pra soltar a
-      // proteção e buscar o estado real na hora.
       if(docId) limparPendenteLocal_('Documentos',[docId]);
       agendarPull(true);
+      if(res && res.ok===false) return {ok:false, erro: res.erro || 'falha no upload'};
       return {ok:true, res:res};
     }).catch(err=>{
-      // Erro/timeout: não soltamos a proteção aqui — em timeout do lado do
-      // cliente o servidor pode ainda estar processando. A proteção expira
-      // sozinha (PENDENTE_LOCAL_MS) e existeUploadPendente_/agendarPull
-      // continuam tentando convergir com o servidor nesse meio-tempo.
       agendarPull();
       return {ok:false, erro: err};
     });
@@ -1306,29 +1236,7 @@ const Sync = {
   escanearPendentes(){return chamarAcaoGet_({acao:'escanearPendentes'});},
   verificarOrfaos(){return chamarAcaoGet_({acao:'verificarOrfaos'});},
   repararDrive(){return gasCall_('apiSincronizarDrive',[session?session.token:'']);},
-  // ITEM 5 (login lento): antes o clique em "Entrar" disparava a chamada
-  // apiLoginDesafio SÓ NESSE MOMENTO — o usuário ficava esperando essa
-  // primeira ida-e-volta ao Apps Script (que pode levar alguns segundos,
-  // sobretudo em "cold start") antes mesmo de começar a validar a senha.
-  // Agora o desafio é pré-buscado em segundo plano assim que o usuário sai
-  // do campo de e-mail (evento blur), enquanto ele ainda está digitando a
-  // senha — na hora de clicar em "Entrar", muitas vezes só falta UMA
-  // chamada (a de verificação), não duas.
   async login(email, senha, _semRetentativa){
-    // V45 SEGURANÇA: login por desafio-resposta (nonce de uso único), em vez
-    // de mandar um hash "fixo" reutilizável (salted/unsalted) por JSONP.
-    // Antes, quem capturasse a URL da requisição (histórico do navegador,
-    // logs, extensões) tinha em mãos o equivalente a uma segunda senha
-    // válida indefinidamente. Agora:
-    //  1) o servidor emite um nonce de uso único com validade de alguns
-    //     minutos (apiLoginDesafio), vinculado a este e-mail;
-    //  2) o navegador calcula localmente SHA-256(senha[+salt]) — o mesmo
-    //     hash que o servidor guarda — e em cima dele calcula uma "prova"
-    //     amarrada a esse nonce específico: SHA-256(hash + "::" + nonce);
-    //  3) o servidor confere a prova e IMEDIATAMENTE apaga o nonce do cache
-    //     (apiLoginComDesafio) — reenviar a mesma URL depois não autentica
-    //     mais nada, o nonce já foi consumido.
-    // A senha em si nunca sai do navegador, nem em texto nem como hash fixo.
     try{
       if(!window.crypto||!crypto.subtle) return {ok:false,erro:'Seu navegador não suporta autenticação segura.'};
       const enc=new TextEncoder();
@@ -1336,9 +1244,6 @@ const Sync = {
         const digest=await crypto.subtle.digest('SHA-256',enc.encode(String(texto||'')));
         return Array.from(new Uint8Array(digest)).map(b=>b.toString(16).padStart(2,'0')).join('');
       }
-      // Reaproveita o desafio pré-buscado se ele for para o MESMO e-mail e
-      // ainda estiver "fresco" (folga de segurança bem abaixo da validade
-      // real no servidor, para nunca depender de acertar o limite exato).
       let desafio = null;
       const pre = desafioPreFetch_;
       if(pre && pre.email === email && pre.dados && (Date.now() - pre.obtidoEm) < 120000){
@@ -1357,12 +1262,6 @@ const Sync = {
       }
       const prova = await sha256Hex_(hashLocal + '::' + String(desafio.nonce));
       const res = await gasCall_('apiLoginComDesafio', [email, [prova], desafio.nonce]);
-      // ITEM 4: se o desafio usado (inclusive um pré-buscado que ficou
-      // esperando o usuário digitar a senha) tiver expirado, tenta de novo
-      // de forma transparente — até duas vezes — buscando um desafio novo
-      // a cada tentativa. O usuário só vê a mensagem de erro se todas as
-      // tentativas falharem (o que na prática deixa de acontecer no dia a
-      // dia, mesmo com rede lenta).
       if(res && res.desafioExpirado && !_semRetentativa){
         return Sync.login(email, senha, 1);
       }
@@ -1382,47 +1281,12 @@ const Sync = {
     if(data.ok===false&&data.authOk===false&&session){limparSessao_();mostrarLogin();return false;}
     const temCampos=['Usuarios','Pastas','Documentos','Empresa','Permissoes'].some(f=>Array.isArray(data[f]));
     if(!temCampos)return false;
-    // ultimaMudou: ver adotarDados acima — permite ao chamador (ex.:
-    // agendarPull) evitar re-render quando o pull não trouxe nada de novo.
     Sync.ultimaMudou = adotarDados(data);
-    // ITEM (arquivo já no Drive/dashboard continua marcado como falha na
-    // janela de envio): um item podia ser marcado 'falha' no painel depois
-    // de esgotadas as tentativas de confirmação (ver
-    // verificarUploadConfirmadoNoServidor_), mas o SERVIDOR terminar de
-    // processá-lo um pouco depois — e como nada reconferia os itens já
-    // marcados como falha, o ícone vermelho (com o botão de reenviar)
-    // ficava preso ali para sempre, mesmo o arquivo já aparecendo
-    // certinho no dashboard. Agora, toda vez que dados novos chegam do
-    // servidor (por qualquer pull, automático ou manual), os itens do
-    // painel de envio ainda marcados como falha são reconferidos — se o
-    // documento já tem driveId, o item é corrigido para sucesso e some do
-    // painel sozinho, como qualquer outro envio bem-sucedido.
     try{ reconciliarPainelUploadComDados_(); }catch(e){}
     return true;
   }
 };
-// CORREÇÃO: aqui é onde a resposta de qualquer pull (automático ou manual)
-// é aplicada por cima do estado local. Antes, "Pastas"/"Documentos" eram
-// sobrescritas incondicionalmente pelo que veio do servidor — é esse ponto
-// exato que causava o "desmover" quando um pull vencia a corrida contra um
-// push de movimentação ainda em andamento (ver pendentesLocal_ acima). Agora
-// aplicamos, nessa ordem: 1) tombstones (itens excluídos localmente não
-// "ressuscitam" — mecanismo que já existia no código mas nunca era chamado);
-// 2) proteção de pendentes locais (itens com push de mudança de pasta em
-// andamento mantêm a versão local até esse push confirmar). O mesmo par de
-// proteções é aplicado em Usuarios/Permissoes só para tombstones, já que não
-// sofrem do mesmo tipo de corrida (não há "Drive" físico envolvido nelas).
-// CORREÇÃO (V48 - tela "se mexendo" sozinha): antes, esta função só
-// gravava os dados vindos do servidor, sem informar se algo de fato
-// mudou. Quem chamava (agendarPull) então chamava renderApp() incondi-
-// cionalmente a cada pull bem-sucedido — e como o polling ficava ativo
-// sempre que havia algum upload/movimentação pendente (às vezes por muito
-// tempo, por causa de push/backend lentos), o dashboard inteiro era
-// re-desenhado (innerHTML trocado) a cada ~3.5s mesmo quando nada tinha
-// mudado, dando a sensação de tela "piscando"/"se mexendo" e perdendo
-// posição de rolagem, menus abertos etc. Agora comparamos o conteúdo
-// antes/depois e devolvemos se algo realmente mudou, para o chamador só
-// re-renderizar quando necessário.
+
 function adotarDados(data){
   let mudou = false;
   try{
