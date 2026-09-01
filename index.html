@@ -716,7 +716,15 @@ const PERMS_LIST = [
   {k:'download',     label:'Download',     ic:'fa-download'},
   {k:'enviar_email', label:'Enviar e-mail',ic:'fa-envelope'},
   {k:'criar_pasta',  label:'Criar pasta',  ic:'fa-folder-plus'},
-  {k:'excluir_pasta',label:'Excluir pasta',ic:'fa-folder-minus'}
+  {k:'excluir_pasta',label:'Excluir pasta',ic:'fa-folder-minus'},
+  // Permissão GLOBAL (não é por pasta, diferente das demais desta lista):
+  // libera a varredura completa de sincronização com o Drive (botão
+  // Atualizar do Dashboard e "Sincronizar com o Drive" de Configurações)
+  // para usuários que não são administradores completos. Como o toggle
+  // por pasta em "Compartilhar" também itera esta mesma lista, esta opção
+  // aparece lá também, mas não tem efeito nenhum ali — só o toggle nas
+  // Permissões globais do usuário (tela Usuários) é considerado.
+  {k:'sincronizar_drive', label:'Sincronizar Drive', ic:'fa-arrows-rotate'}
 ];
 const ALL_PERMS = PERMS_LIST.map(p => p.k);
 const PRESETS = {
@@ -1230,12 +1238,12 @@ const Sync = {
     });
     return p;
   },
-  ensureDriveRoot(){const u=currentUser();if(!u||!ehAdmin(u)||!DEFAULT_GAS_URL)return;gasCall_('apiEnsureRoot',[session.token]).catch(()=>{});},
+  ensureDriveRoot(){const u=currentUser();if(!u||!podeSincronizarDrive_(u)||!DEFAULT_GAS_URL)return;gasCall_('apiEnsureRoot',[session.token]).catch(()=>{});},
   excluirDrive(tipo,registroId){if(!session||!registroId)return Promise.reject(new Error('sessão indisponível'));return gasCall_('apiExcluirDrive',[session.token,tipo,registroId]);},
   limparExcluidos(){if(!session)return;return gasCall_('apiLimparExcluidos',[session.token]);},
-  escanearPendentes(){return chamarAcaoGet_({acao:'escanearPendentes'});},
-  verificarOrfaos(){return chamarAcaoGet_({acao:'verificarOrfaos'});},
-  repararDrive(){return gasCall_('apiSincronizarDrive',[session?session.token:'']);},
+  escanearPendentes(pastaId){return chamarAcaoGet_({acao:'escanearPendentes', pastaId: pastaId||null});},
+  verificarOrfaos(pastaId){return chamarAcaoGet_({acao:'verificarOrfaos', pastaId: pastaId||null});},
+  repararDrive(pastaId){return gasCall_('apiSincronizarDrive',[session?session.token:'', pastaId||null]);},
   async login(email, senha, _semRetentativa){
     try{
       if(!window.crypto||!crypto.subtle) return {ok:false,erro:'Seu navegador não suporta autenticação segura.'};
@@ -1465,7 +1473,7 @@ function sincronizarInicial(){
 let pendentesJaChecados = false;
 function verificarPendentesDrive(){
   const u = currentUser();
-  if(!u || !ehAdmin(u) || !Sync.url() || pendentesJaChecados) return;
+  if(!u || !podeSincronizarDrive_(u) || !Sync.url() || pendentesJaChecados) return;
   pendentesJaChecados = true;
   Sync.escanearPendentes().then(res => {
     if(!res || res.ok === false) return;
@@ -1498,12 +1506,14 @@ function modalPendentesDrive(pastas, arquivos){
 // São as duas metades de uma reconciliação completa — agora rodam em
 // sequência, num único botão: primeiro importa o que falta, depois
 // verifica o que sobrou.
-function sincronizacaoCompletaDrive_(){
+function sincronizacaoCompletaDrive_(pastaId){
   const u = currentUser();
-  if(!u || !ehAdmin(u) || !Sync.url()){ toast('Configure a URL do backend primeiro.','error'); return Promise.resolve(); }
-  toast('Sincronizando com o Drive…','info');
+  if(!u || !podeSincronizarDrive_(u) || !Sync.url()){ toast('Configure a URL do backend primeiro.','error'); return Promise.resolve(); }
+  const escopo = pastaId || null;
+  const pastaEscopo = escopo ? pastaPorId(escopo) : null;
+  toast(pastaEscopo ? ('Sincronizando "' + pastaEscopo.nome + '" com o Drive…') : 'Sincronizando com o Drive…', 'info');
   Sync.ensureDriveRoot();
-  return Sync.repararDrive().then(res => {
+  return Sync.repararDrive(escopo).then(res => {
     if(!res || res.ok === false){
       toast((res&&res.erro)||'Não foi possível sincronizar as pastas do Google Drive.','error');
       return;
@@ -1514,8 +1524,14 @@ function sincronizacaoCompletaDrive_(){
         return;
       }
       renderApp();
-      pendentesJaChecados = false;
-      verificarPendentesDrive();
+      // A checagem de "itens pendentes" (modal de importação no primeiro
+      // carregamento) continua sendo só do sistema inteiro — quando a
+      // sincronização já foi escopada a uma pasta, repararDrive() acima já
+      // cuidou de importar o que faltava especificamente ali.
+      if(!escopo){
+        pendentesJaChecados = false;
+        verificarPendentesDrive();
+      }
       // CORREÇÃO (V48): para árvores grandes de pastas no Drive, o servidor
       // pode devolver "completo:false" — processou um trecho da árvore
       // dentro do tempo disponível e parou de propósito (em vez de estourar
@@ -1524,12 +1540,13 @@ function sincronizacaoCompletaDrive_(){
       // (itens removidos do Drive) — não faz sentido avisar sobre "itens
       // removidos" enquanto a importação ainda está incompleta.
       if(res.completo === false){
-        toast('Parte das pastas/arquivos do Drive foi sincronizada. Clique em "Sincronizar com o Drive" novamente para continuar (árvore grande, processada em etapas).','info');
+        toast('Parte das pastas/arquivos do Drive foi sincronizada. Clique em "Atualizar" novamente para continuar (área grande, processada em etapas).','info');
         return;
       }
       // Importação concluída — agora verifica o sentido oposto: itens que
-      // estão na planilha mas não existem mais no Drive.
-      return Sync.verificarOrfaos().then(res2 => {
+      // estão na planilha mas não existem mais no Drive (também escopado à
+      // mesma pasta, quando informado).
+      return Sync.verificarOrfaos(escopo).then(res2 => {
         if(!res2 || res2.ok === false){ toast('Itens do Drive importados. Não foi possível verificar itens removidos do Drive agora.','error'); return; }
         const pastas = res2.pastas || [], arquivos = res2.arquivos || [];
         if(!pastas.length && !arquivos.length){
@@ -2181,6 +2198,10 @@ function viewModeDefault(){ return ehMobile() ? 'lista' : 'detalhes'; }
 
 function currentUser(){ return session ? getUsuarios().find(u => u.id === session.userId) : null; }
 function ehAdmin(u){ return u && (u.papel === 'master' || u.papel === 'admin'); }
+// Global (não depende de pasta) — libera a varredura completa de
+// sincronização com o Drive tanto para administradores quanto para
+// usuários com a permissão granular 'sincronizar_drive' (ver PERMS_LIST).
+function podeSincronizarDrive_(u){ return !!u && (ehAdmin(u) || (Array.isArray(u.perms) && u.perms.indexOf('sincronizar_drive') !== -1)); }
 function pastaPorId(id){ return id ? DB.get('Pastas').find(p => p.id === id) : null; }
 function ownerIsAdmin(p){
   // CORREÇÃO (V48 - itens excluídos "voltando sozinhos"): usuários sem
@@ -4332,19 +4353,23 @@ document.addEventListener('click', e => {
     case 'enviar-arquivo': { const inp = $('#fileInput'); if(inp){ inp.accept = acceptString(); inp.click(); } break; }
     case 'enviar-pasta': { const inp = $('#folderInput'); if(inp){ inp.click(); } break; }
     case 'sincronizar-agora': {
-      // Botão "Atualizar" da barra do Dashboard. Para administradores, roda
-      // a MESMA varredura completa do botão "Sincronizar com o Drive" de
-      // Configurações (importa arquivos/pastas órfãos do Drive e verifica
-      // itens removidos) — não só um pull leve — já que é o admin quem tem
-      // permissão pra essa varredura no servidor. Para os demais usuários,
-      // continua sendo só um pull leve (o servidor recusaria a varredura
-      // completa de qualquer forma).
+      // Botão "Atualizar" da barra do Dashboard. Para administradores E
+      // para usuários com a permissão granular 'sincronizar_drive' (ver
+      // PERMS_LIST / Usuários → permissões globais), roda a MESMA
+      // varredura completa do botão "Sincronizar com o Drive" de
+      // Configurações, mas ESCOPADA à pasta atualmente aberta (e
+      // subpastas dela) — não a árvore inteira da empresa. Isso é bem mais
+      // rápido e evita esbarrar no limite de itens/tempo do servidor
+      // quando a conta já tem muitas outras pastas/empresas cadastradas.
+      // Estando na Raiz (nenhuma pasta aberta), o escopo é a árvore
+      // inteira mesmo, já que não há uma pasta mais específica pra usar.
+      // Para os demais usuários, continua sendo só um pull leve.
       const icone = el.querySelector('i');
       if(icone) icone.classList.add('fa-spin');
       el.disabled = true;
       const acaoFinal = () => { if(icone) icone.classList.remove('fa-spin'); el.disabled = false; };
-      if(ehAdmin(u)){
-        Promise.resolve(sincronizacaoCompletaDrive_()).finally(acaoFinal);
+      if(podeSincronizarDrive_(u)){
+        Promise.resolve(sincronizacaoCompletaDrive_(state.currentFolderId)).finally(acaoFinal);
         break;
       }
       Sync.ensureDriveRoot();
@@ -5022,8 +5047,6 @@ try{
   try{ toast('Erro na inicialização: ' + err.message, 'error'); }catch(e){}
   mostrarLogin();
 }
-
-
 
 </script>
 </body>
