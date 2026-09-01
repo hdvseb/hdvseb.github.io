@@ -559,9 +559,7 @@ const BUILD_ID = 'SGD-GITHUB-V44-LOGIN-POST-LOGO-CONFIG';
 // outro lugar deste arquivo (nem em comentários, nem dentro de textos) —
 // o HtmlService varre o arquivo INTEIRO à procura delas, e uma ocorrência
 // perdida vira um "SyntaxError: Invalid or unexpected token" ao publicar.
-//const DEFAULT_GAS_URL = '<?= ScriptApp.getService().getUrl() ?>';
-
-const DEFAULT_GAS_URL = 'https://script.google.com/macros/s/AKfycbzKAFMRz_znGT_Z5O_am6gWgMaslEVaOC7l5SojDp7M6TDMSMHFNyYX-zKbB4FYt2xbqA/exec';
+const DEFAULT_GAS_URL = '<?= ScriptApp.getService().getUrl() ?>';
 const RPC_DISPONIVEL = !!DEFAULT_GAS_URL;
 // REMOÇÃO (item 10): a busca automática de GAS_URL na aba "Settings" via
 // exportação CSV pública (gviz/tq) foi removida. Ela dependia da planilha
@@ -1502,10 +1500,10 @@ function modalPendentesDrive(pastas, arquivos){
 // verifica o que sobrou.
 function sincronizacaoCompletaDrive_(){
   const u = currentUser();
-  if(!u || !ehAdmin(u) || !Sync.url()){ toast('Configure a URL do backend primeiro.','error'); return; }
+  if(!u || !ehAdmin(u) || !Sync.url()){ toast('Configure a URL do backend primeiro.','error'); return Promise.resolve(); }
   toast('Sincronizando com o Drive…','info');
   Sync.ensureDriveRoot();
-  Sync.repararDrive().then(res => {
+  return Sync.repararDrive().then(res => {
     if(!res || res.ok === false){
       toast((res&&res.erro)||'Não foi possível sincronizar as pastas do Google Drive.','error');
       return;
@@ -3361,11 +3359,17 @@ function atualizarItemLote_(indice, estado){
     else if(estado === 'cancelado') statusEl.innerHTML = '<i class="fa-solid fa-ban"></i>';
     else statusEl.innerHTML = '<i class="fa-solid fa-circle-exclamation"></i>';
   }
-  // O X de cancelar só faz sentido enquanto o arquivo ainda não terminou
-  // (aguardando na fila ou enviando); depois de concluído (ok/falha/já
-  // cancelado) ele é escondido. O ícone de reenviar é o oposto: só
-  // aparece justamente quando o arquivo TERMINOU com falha.
-  if(cancelarEl) cancelarEl.classList.toggle('hidden', estado === 'ok' || estado === 'falha' || estado === 'cancelado');
+  // O X de cancelar continua escondido quando o item já terminou bem (ok)
+  // ou já foi cancelado (nesses casos ele some sozinho da lista, ver
+  // abaixo). Quando o item termina em FALHA, porém, o X permanece visível
+  // — reaproveitado aqui como "remover da lista", já que o botão de
+  // Reenviar nem sempre resolve (ex.: quando o conteúdo local sumiu do
+  // navegador) e antes não sobrava nenhuma forma de tirar o item travado
+  // da tela (ver cancelarItemLote_).
+  if(cancelarEl){
+    cancelarEl.classList.toggle('hidden', estado === 'ok' || estado === 'cancelado');
+    cancelarEl.title = (estado === 'falha') ? 'Remover da lista' : 'Cancelar';
+  }
   if(reenviarEl) reenviarEl.classList.toggle('hidden', estado !== 'falha');
   // ITEM (remover da janela de envio à medida que sobe): arquivos enviados
   // com sucesso (ou cancelados, que não precisam de nenhuma ação do
@@ -3449,9 +3453,18 @@ function verificarFechamentoAutomaticoLote_(){
 // o resultado é descartado e o item aparece como "cancelado" para o
 // usuário.
 function cancelarItemLote_(indice){
+  const statusEl = document.getElementById('upStatus-' + indice);
+  // Item já terminou com falha: o X aqui vira "remover da lista" (ver
+  // atualizarItemLote_) — só descarta visualmente o item, sem depender do
+  // lote ainda estar em andamento (uploadLoteAtivo_ pode já ter virado
+  // null se o lote inteiro já encerrou, o que antes fazia este clique não
+  // fazer nada e deixava o item travado pra sempre no painel).
+  if(statusEl && statusEl.classList.contains('falha')){
+    removerItemLote_(document.getElementById('upItem-' + indice));
+    return;
+  }
   if(!uploadLoteAtivo_) return;
   uploadLoteAtivo_.cancelados.add(indice);
-  const statusEl = document.getElementById('upStatus-' + indice);
   // Só marca visualmente na hora se ainda estiver "aguardando" (relógio) —
   // se já estiver "enviando", o próprio trabalhador atualiza o visual
   // quando a chamada em andamento terminar (ver handleUploadLote).
@@ -3485,6 +3498,14 @@ async function reenviarItemLote_(indice){
       DB.set('Documentos', DB.get('Documentos').map(x => x.id === item.docId ? Object.assign({}, x, {erroUpload:''}) : x));
       const res = await enviarArquivoAoDrive_(Object.assign({}, docExistente, {erroUpload:''}));
       ok = !!(res && res.ok);
+      // Aplica o driveId/driveUrl já retornados pelo servidor direto no
+      // cache local — sem isso, o item só sai do estado "sem driveId" (e
+      // só entra na contagem/lista do dashboard) depois que um pull em
+      // segundo plano confirmar, o que pode levar alguns segundos e dá a
+      // impressão de que o total de arquivos não atualizou ao reenviar.
+      if(ok && res.res && res.res.driveId){
+        DB.set('Documentos', DB.get('Documentos').map(x => x.id === item.docId ? Object.assign({}, x, {driveId: res.res.driveId, driveUrl: res.res.driveUrl || '', arquivo:'', erroUpload:''}) : x));
+      }
       // Mesma verificação de segurança do lote automático: se o cliente
       // deu como falha (timeout) mas o servidor tinha na verdade
       // terminado o envio, confirma antes de mostrar o ícone vermelho de
@@ -4311,17 +4332,21 @@ document.addEventListener('click', e => {
     case 'enviar-arquivo': { const inp = $('#fileInput'); if(inp){ inp.accept = acceptString(); inp.click(); } break; }
     case 'enviar-pasta': { const inp = $('#folderInput'); if(inp){ inp.click(); } break; }
     case 'sincronizar-agora': {
-      // Botão "Atualizar" da barra do Dashboard — ação leve, disponível
-      // para qualquer usuário: só busca do servidor o que já mudou (um
-      // arquivo que terminou de subir mas a tela local ainda não
-      // refletia, por exemplo), sem precisar recarregar a página. É
-      // diferente da "Sincronizar com o Drive" em Configurações (só para
-      // administradores), que varre o Drive inteiro em busca de itens
-      // para importar ou remover — por isso os nomes agora são distintos,
-      // para não parecer a mesma ação.
+      // Botão "Atualizar" da barra do Dashboard. Para administradores, roda
+      // a MESMA varredura completa do botão "Sincronizar com o Drive" de
+      // Configurações (importa arquivos/pastas órfãos do Drive e verifica
+      // itens removidos) — não só um pull leve — já que é o admin quem tem
+      // permissão pra essa varredura no servidor. Para os demais usuários,
+      // continua sendo só um pull leve (o servidor recusaria a varredura
+      // completa de qualquer forma).
       const icone = el.querySelector('i');
       if(icone) icone.classList.add('fa-spin');
       el.disabled = true;
+      const acaoFinal = () => { if(icone) icone.classList.remove('fa-spin'); el.disabled = false; };
+      if(ehAdmin(u)){
+        Promise.resolve(sincronizacaoCompletaDrive_()).finally(acaoFinal);
+        break;
+      }
       Sync.ensureDriveRoot();
       Sync.pull().then(data => {
         if(data) Sync.applyData(data);
@@ -4330,10 +4355,7 @@ document.addEventListener('click', e => {
       }).catch(() => {
         toast('Não foi possível atualizar agora. Tentando de novo em segundo plano…', 'error');
         agendarPull();
-      }).finally(() => {
-        if(icone) icone.classList.remove('fa-spin');
-        el.disabled = false;
-      });
+      }).finally(acaoFinal);
       break;
     }
     case 'abrir-camera':
