@@ -804,7 +804,25 @@ const DB = {
       if(!Array.isArray(parsed)) return parsed;
       const porId = new Map();
       const semId = [];
-      parsed.forEach(r => { if(r && r.id) porId.set(r.id, r); else semId.push(r); });
+      parsed.forEach(r => {
+        if(!r || !r.id){ semId.push(r); return; }
+        const atual = porId.get(r.id);
+        if(!atual){ porId.set(r.id, r); return; }
+        // ITEM (id duplicado escondendo o registro bom): antes, a última
+        // ocorrência do id no array sempre "vencia", presumindo ser sempre
+        // a mais completa. Se uma condição de corrida na gravação deixar
+        // uma cópia INCOMPLETA (sem driveId) depois da cópia boa na
+        // planilha, a incompleta acabava escondendo a completa — o
+        // arquivo sumia da contagem/lista mesmo já enviado com sucesso.
+        // Agora prioriza quem tem driveId preenchido; empatado nisso,
+        // prioriza o mais recente por atualizadoEm/criadoEm.
+        const atualCompleto = !!atual.driveId, novoCompleto = !!r.driveId;
+        if(novoCompleto && !atualCompleto){ porId.set(r.id, r); return; }
+        if(!novoCompleto && atualCompleto){ return; }
+        const tsAtual = atual.atualizadoEm || atual.criadoEm || 0;
+        const tsNovo = r.atualizadoEm || r.criadoEm || 0;
+        if(tsNovo >= tsAtual) porId.set(r.id, r);
+      });
       return semId.concat(Array.from(porId.values()));
     }catch(e){ return []; }
   },
@@ -1244,6 +1262,7 @@ const Sync = {
   escanearPendentes(pastaId){return chamarAcaoGet_({acao:'escanearPendentes', pastaId: pastaId||null});},
   verificarOrfaos(pastaId){return chamarAcaoGet_({acao:'verificarOrfaos', pastaId: pastaId||null});},
   repararDrive(pastaId){return gasCall_('apiSincronizarDrive',[session?session.token:'', pastaId||null]);},
+  limparIdsDuplicados(){return gasCall_('apiLimparIdsDuplicados',[session?session.token:'']);},
   async login(email, senha, _semRetentativa){
     try{
       if(!window.crypto||!crypto.subtle) return {ok:false,erro:'Seu navegador não suporta autenticação segura.'};
@@ -1918,7 +1937,7 @@ function renderCamPages(){
    Só quando o documento nunca chegou a ter driveId (upload original que
    falhou) é que usamos a cópia local do arquivo para reenviar o conteúdo. */
 
-function reenviarUpload(docId){
+async function reenviarUpload(docId){
   const d = DB.get('Documentos').find(x => x.id === docId);
   if(!d){ return; }
   if(d.driveId){
@@ -1932,8 +1951,19 @@ function reenviarUpload(docId){
     return;
   }
   DB.set('Documentos', DB.get('Documentos').map(x => x.id === docId ? Object.assign({}, x, {erroUpload:''}) : x));
-  enviarArquivoAoDrive_(d);
   toast('Reenviando "' + d.titulo + '" para o Drive…');
+  renderItens();
+  const res = await enviarArquivoAoDrive_(d);
+  // Aplica o driveId/driveUrl já retornados pelo servidor direto no cache
+  // local, assim que o envio termina de verdade — sem isso, o total de
+  // arquivos e a lista só refletiam o reenvio depois que uma sincronização
+  // em segundo plano confirmasse (podendo levar alguns segundos).
+  if(res && res.ok && res.res && res.res.driveId){
+    DB.set('Documentos', DB.get('Documentos').map(x => x.id === docId ? Object.assign({}, x, {driveId: res.res.driveId, driveUrl: res.res.driveUrl || '', arquivo:'', erroUpload:''}) : x));
+  } else if(res && res.ok === false){
+    DB.set('Documentos', DB.get('Documentos').map(x => x.id === docId ? Object.assign({}, x, {erroUpload: String(res.erro||'falha ao reenviar')}) : x));
+    toast('Falha ao reenviar "' + d.titulo + '": ' + (res.erro || 'motivo desconhecido'), 'error');
+  }
   renderItens();
 }
 
@@ -1972,7 +2002,18 @@ function salvarDocArquivo(base, dataUrl){
   // que permite ao lote de upload esperar um arquivo terminar antes de
   // começar o próximo, em vez de disparar tudo de uma vez.
   const pUpload = Sync.url() ? Promise.resolve(pPush).then(() => enviarArquivoAoDrive_(doc)) : Promise.resolve({ok:true});
-  return Promise.resolve(pUpload).then(res => (res && res.ok) !== false);
+  return Promise.resolve(pUpload).then(res => {
+    const ok = (res && res.ok) !== false;
+    // Aplica o driveId/driveUrl já retornados pelo servidor direto no
+    // cache local assim que o upload termina de verdade — sem isso, o
+    // total de arquivos e a lista só refletiam o envio depois que uma
+    // sincronização em segundo plano confirmasse (podendo levar alguns
+    // segundos após um lote/reenvio terminar).
+    if(ok && res && res.res && res.res.driveId){
+      DB.set('Documentos', DB.get('Documentos').map(x => x.id === doc.id ? Object.assign({}, x, {driveId: res.res.driveId, driveUrl: res.res.driveUrl || '', arquivo:'', erroUpload:''}) : x));
+    }
+    return ok;
+  });
 }
 
 
@@ -2847,6 +2888,22 @@ function itensVisiveis(){
   docs    = docs.slice().sort((a, b) => campo === 'nome' ? comparar(a, b, 'titulo') : comparar(a, b));
   return {folders, docs, buscaGlobal: !!q};
 }
+// Atualiza só o número "X pastas • Y arquivos" do topo do Dashboard, sem
+// re-renderizar a lista inteira. Recebe os totais já calculados quando o
+// chamador já tem essa informação (renderItens); senão, recalcula sozinha
+// a partir de itensVisiveis() — é o caminho usado durante um lote de
+// upload/reenvio ativo, onde a lista fica parada de propósito (ver
+// handleUploadLote) mas o contador deve continuar subindo em tempo real a
+// cada arquivo que termina.
+function atualizarContagemArquivos_(totalPastas, totalArquivos){
+  const cont = $('#contagemArquivos');
+  if(!cont) return;
+  if(totalPastas === undefined || totalArquivos === undefined){
+    const iv = itensVisiveis();
+    totalPastas = iv.folders.length; totalArquivos = iv.docs.length;
+  }
+  cont.innerHTML = '<i class="fa-solid fa-folder"></i> ' + totalPastas + ' pasta' + (totalPastas === 1 ? '' : 's') + ' &nbsp;•&nbsp; <i class="fa-solid fa-file"></i> ' + totalArquivos + ' arquivo' + (totalArquivos === 1 ? '' : 's');
+}
 function renderItens(){
   const el = $('#itens'); if(!el) return;
   try{
@@ -2858,11 +2915,7 @@ function renderItens(){
     // chama renderItens(), não renderDashboard()). Agora o contador é
     // atualizado aqui, a cada renderização, refletindo o resultado da
     // busca (inclusive busca global em todas as pastas).
-    const cont = $('#contagemArquivos');
-    if(cont){
-      const totalPastas = folders.length, totalArquivos = docs.length;
-      cont.innerHTML = '<i class="fa-solid fa-folder"></i> ' + totalPastas + ' pasta' + (totalPastas === 1 ? '' : 's') + ' &nbsp;•&nbsp; <i class="fa-solid fa-file"></i> ' + totalArquivos + ' arquivo' + (totalArquivos === 1 ? '' : 's');
-    }
+    atualizarContagemArquivos_(folders.length, docs.length);
     const perms = permsAtuais();
     const usuarios = getUsuarios();
     const nomeDe = id => (usuarios.find(x => x.id === id) || {}).nome || '—';
@@ -3392,6 +3445,11 @@ function atualizarItemLote_(indice, estado){
     cancelarEl.title = (estado === 'falha') ? 'Remover da lista' : 'Cancelar';
   }
   if(reenviarEl) reenviarEl.classList.toggle('hidden', estado !== 'falha');
+  // Atualiza só o número do contador (não a lista inteira, que fica
+  // parada de propósito durante um lote ativo — ver comentário logo
+  // abaixo) assim que este item específico é confirmado no Drive, para o
+  // total de arquivos subir em tempo real conforme cada um termina.
+  if(estado === 'ok') atualizarContagemArquivos_();
   // ITEM (remover da janela de envio à medida que sobe): arquivos enviados
   // com sucesso (ou cancelados, que não precisam de nenhuma ação do
   // usuário) somem da lista pouco depois de concluídos — só o "check"
@@ -3888,7 +3946,8 @@ function renderConfig(){
 */
     '<div class="cfg-body"><div class="integ-row">' +
     '<button class="btn btn-light" data-action="verificar-versao"><i class="fa-solid fa-rotate"></i> Verificar versão</button>' +
-    '<button class="btn btn-light" data-action="sincronizar-drive"><i class="fa-solid fa-arrows-rotate"></i> Sincronizar com o Drive</button></div>' +
+    '<button class="btn btn-light" data-action="sincronizar-drive"><i class="fa-solid fa-arrows-rotate"></i> Sincronizar com o Drive</button>' +
+    '<button class="btn btn-light" data-action="limpar-ids-duplicados"><i class="fa-solid fa-broom"></i> Limpar IDs duplicados</button></div>' +
     //'<p class="modal-sub" style="padding:0;margin-top:8px"><i class="fa-solid fa-circle-info"></i> "Sincronizar com o Drive" varre a árvore física de "SGD_Arquivos": importa/vincula o que já existe lá mas ainda não está na planilha, e avisa sobre o que está na planilha mas não existe mais no Drive. Isso não roda mais sozinho ao abrir o app ou fazer login — só quando você clicar aqui.</p></div>' +
   //'</section>' +
   //'<section class="card" style="margin-top:20px"><div class="card-head"><h2><i class="fa-solid fa-code"></i> Backend Apps Script (Sheets + Drive) — VERSÃO ' + APP_VERSAO + '</h2></div>' +
@@ -4050,6 +4109,20 @@ document.addEventListener('click', e => {
     case 'sincronizar-drive': {
       if(!ehAdmin(u)){ toast('Apenas administradores podem sincronizar com o Drive.','error'); break; }
       sincronizacaoCompletaDrive_();
+      break;
+    }
+    case 'limpar-ids-duplicados': {
+      if(!podeSincronizarDrive_(u)){ toast('Sem permissão para esta ação.','error'); break; }
+      modalConfirm('Limpar IDs duplicados', 'Procura linhas de Documentos/Pastas que compartilham o mesmo id (efeito de uma gravação concorrente) e remove a cópia incompleta de cada grupo, mantendo sempre a mais completa. Não mexe em registros com ids diferentes. Continuar?', () => {
+        toast('Procurando e limpando duplicatas…','info');
+        Sync.limparIdsDuplicados().then(res => {
+          if(!res || res.ok === false){ toast((res&&res.erro)||'Não foi possível limpar as duplicatas.','error'); return; }
+          const total = (res.documentosRemovidos||0) + (res.pastasRemovidas||0);
+          if(!total){ toast('Nenhuma linha duplicada encontrada.'); return; }
+          toast(res.documentosRemovidos + ' documento(s) e ' + res.pastasRemovidas + ' pasta(s) duplicados removidos.');
+          Sync.pull().then(data => { if(data) Sync.applyData(data); renderApp(); }).catch(()=>{});
+        }).catch(() => toast('Falha de conexão ao limpar duplicatas.','error'));
+      });
       break;
     }
     case 'remover-orfaos-drive': {
