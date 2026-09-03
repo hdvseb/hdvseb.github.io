@@ -252,6 +252,14 @@ td{padding:12px;border-bottom:1px solid #edf1f7;vertical-align:middle}
 .cam-item{position:relative}
 .cam-item img{width:100%;height:110px;object-fit:cover;border-radius:8px;border:1px solid var(--border);display:block}
 .cam-item .btn-ic{position:absolute;top:-9px;right:-9px}
+/* ===== ajuste de bordas do documento (tipo scanner) ===== */
+.modal-card.modal-ajuste-bordas{max-width:640px}
+.ajuste-bordas-wrap{position:relative;width:100%;max-height:60vh;overflow:hidden;border-radius:10px;background:#111;touch-action:none;user-select:none;-webkit-user-select:none}
+.ajuste-bordas-wrap img{display:block;width:100%;height:auto;max-height:60vh;object-fit:contain;pointer-events:none;user-select:none;-webkit-user-select:none}
+.ajuste-bordas-svg{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
+.ajuste-poligono{fill:rgba(21,82,194,.22);stroke:var(--primary);stroke-width:.6;vector-effect:non-scaling-stroke}
+.ajuste-handle{fill:#fff;stroke:var(--primary);stroke-width:.8;vector-effect:non-scaling-stroke;cursor:grab;touch-action:none}
+.ajuste-handle:active{cursor:grabbing;fill:var(--primary)}
 /* ===== permissões da pasta ===== */
 .perm-topbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:0 0 12px}
 .perm-topbar .search-box{height:40px;min-width:200px}
@@ -843,7 +851,16 @@ const DB = {
     });
     guardarFolhaSeguro(f, rows);
     if((f === 'Documentos' || f === 'Pastas') && alterados.length) marcarPendenteLocal_(f, alterados);
-    return Sync.push(f, rows, alterados);
+    // CORREÇÃO CRÍTICA (perda de dados ao editar com cache local
+    // incompleto): junto com o array completo, manda também os ids que o
+    // PRÓPRIO app marcou como exclusão de verdade nesta folha (ver
+    // marcarExcluido_, chamado por toda ação real de excluir, sempre
+    // ANTES do DB.set correspondente). O servidor agora só apaga esses
+    // ids explícitos — nunca mais infere exclusão pela simples ausência
+    // no array, o que antes apagava pastas/documentos que o navegador
+    // nunca chegou a carregar (ex.: outra empresa/pasta não navegada).
+    const idsExcluidos = tombstones[f] ? Array.from(tombstones[f].keys()) : [];
+    return Sync.push(f, rows, alterados, idsExcluidos);
   }
 };
 /* ============ TOMBSTONES (evita que exclusões "ressuscitem" numa sincronização em andamento) ============
@@ -1135,9 +1152,27 @@ function gasCall_(fn,args,timeoutMs){
 function postApi_(payload){
   if(typeof google !== 'undefined' && google.script && google.script.run){
     return new Promise((resolve, reject) => {
+      let done = false;
+      // ITEM (upload trava sem aviso no celular): este caminho não tinha
+      // NENHUM timeout — numa conexão de celular instável (comum durante
+      // captura de fotos, troca de rede wifi/dados, ou a aba ficando em
+      // segundo plano), a chamada podia ficar pendurada indefinidamente,
+      // sem nunca chamar sucesso nem falha, deixando o usuário sem
+      // nenhum feedback. Agora, depois de 45s sem resposta, desiste com
+      // uma mensagem clara — o mesmo padrão já usado no canal JSONP
+      // (30s) logo abaixo, com uma margem um pouco maior aqui porque o
+      // conteúdo do arquivo pode ser mais pesado.
+      const timer = setTimeout(() => {
+        if(done) return; done = true;
+        reject(new Error('Tempo esgotado ao enviar o arquivo. Verifique sua conexão com a internet e tente novamente.'));
+      }, 45000);
       google.script.run
-        .withSuccessHandler(function(res){ resolve(res); })
+        .withSuccessHandler(function(res){
+          if(done) return; done = true; clearTimeout(timer);
+          resolve(res);
+        })
         .withFailureHandler(function(err){
+          if(done) return; done = true; clearTimeout(timer);
           reject(new Error(err && err.message ? err.message : 'Erro no upload'));
         })
         .uploadArquivoViaScriptRun(payload.payload);
@@ -1212,11 +1247,11 @@ function corpoComUsuario_(extra){ return Object.assign({token:session?session.to
 
 const Sync = {
   url(){ return !!DEFAULT_GAS_URL; },
-  push(f,rows,idsAlterados){
+  push(f,rows,idsAlterados,idsExcluidos){
     if(!session||!DEFAULT_GAS_URL)return Promise.resolve({ok:false});
     let out=rows;
     if(f==='Documentos')out=rows.map(r=>{if(!r.arquivo)return r;const c=Object.assign({},r);delete c.arquivo;return c;});
-    const body=corpoComUsuario_({folha:f,rows:out});
+    const body=corpoComUsuario_({folha:f,rows:out,idsExcluidos:Array.isArray(idsExcluidos)?idsExcluidos:[]});
     const fila = filaPush_[f] || (filaPush_[f] = []);
     const anterior = fila.length >= PUSH_CONCORRENCIA ? fila.shift() : Promise.resolve();
     const idsProtegidos=Array.isArray(idsAlterados)?idsAlterados:[];
@@ -1692,6 +1727,9 @@ function fileToJpegDataUrl(file, maxDim, quality){
   });
 }
 function paginasParaPDF(pages){
+  if(!window.jspdf || !window.jspdf.jsPDF){
+    throw new Error('Biblioteca de geração de PDF (jsPDF) não carregou no navegador. Verifique sua conexão com a internet, desative bloqueadores de script/anúncio para este site e recarregue a página.');
+  }
   const jsPDF = window.jspdf.jsPDF;
   const pdf = new jsPDF({unit:'mm', format:'a4'});
   pages.forEach((p, i) => {
@@ -1882,6 +1920,143 @@ function sheetCols(){
 
 /* ===== CÂMERA ===== */
 let camPages = [];
+/* ===== DETECÇÃO DE BORDAS + RECORTE DE PERSPECTIVA (tipo scanner) =====
+   Estado da etapa de ajuste de bordas: uma imagem por vez (ajusteImg),
+   os 4 cantos escolhidos em coordenadas RELATIVAS 0–1 da imagem
+   (ajusteCantos = {tl,tr,br,bl}), e uma fila de arquivos ainda não
+   processados (ajusteFila) para o caso de seleção múltipla pela galeria
+   — cada imagem passa pela tela de ajuste, uma de cada vez. */
+let ajusteImg = null;
+let ajusteCantos = null;
+let ajusteFila = [];
+function distanciaPontos_(a, b){ return Math.hypot(a.x - b.x, a.y - b.y); }
+// Detecção automática (melhor esforço) das bordas do documento: reduz a
+// imagem, converte para escala de cinza, calcula a intensidade de borda
+// por linha/coluna (gradiente simples) e acha onde a borda do documento
+// provavelmente termina, varrendo de cada lado para o centro. Não é uma
+// detecção de contorno completa (como visão computacional de verdade
+// faria), mas dá um ponto de partida razoável na maioria das fotos — o
+// usuário sempre pode arrastar os cantos para corrigir depois.
+function detectarBordasIniciais_(img){
+  try{
+    const maxDim = 400;
+    const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+    if(!iw || !ih) return null;
+    const scale = Math.min(1, maxDim / Math.max(iw, ih));
+    const w = Math.max(1, Math.round(iw * scale)), h = Math.max(1, Math.round(ih * scale));
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    ctx.drawImage(img, 0, 0, w, h);
+    const data = ctx.getImageData(0, 0, w, h).data;
+    const gray = new Float32Array(w * h);
+    for(let i = 0; i < w * h; i++){
+      gray[i] = 0.299*data[i*4] + 0.587*data[i*4+1] + 0.114*data[i*4+2];
+    }
+    const colEdge = new Float32Array(w), rowEdge = new Float32Array(h);
+    for(let y = 1; y < h-1; y++){
+      for(let x = 1; x < w-1; x++){
+        const idx = y*w+x;
+        colEdge[x] += Math.abs(gray[idx+1] - gray[idx-1]);
+        rowEdge[y] += Math.abs(gray[idx+w] - gray[idx-w]);
+      }
+    }
+    function acharLimite_(arr, doInicioParaFim){
+      const n = arr.length;
+      let max = 0;
+      for(let i = 0; i < n; i++) if(arr[i] > max) max = arr[i];
+      if(max <= 0) return doInicioParaFim ? Math.round(n*0.04) : Math.round(n*0.96);
+      const limiar = max * 0.15;
+      if(doInicioParaFim){
+        for(let i = 0; i < n; i++) if(arr[i] >= limiar) return Math.max(0, i - Math.round(n*0.01));
+        return Math.round(n*0.04);
+      }
+      for(let i = n-1; i >= 0; i--) if(arr[i] >= limiar) return Math.min(n-1, i + Math.round(n*0.01));
+      return Math.round(n*0.96);
+    }
+    let l = acharLimite_(colEdge, true) / w, r = acharLimite_(colEdge, false) / w;
+    let t = acharLimite_(rowEdge, true) / h, b = acharLimite_(rowEdge, false) / h;
+    if(r < l){ const tmp = l; l = r; r = tmp; }
+    if(b < t){ const tmp = t; t = b; b = tmp; }
+    // Margem de segurança: se a detecção deu uma área minúscula ou quase
+    // a imagem inteira sem sobra nenhuma, usa uma margem padrão em vez de
+    // confiar num resultado pouco útil.
+    if((r - l) < 0.25 || (b - t) < 0.25){ l = 0.04; r = 0.96; t = 0.04; b = 0.96; }
+    return { tl:{x:l,y:t}, tr:{x:r,y:t}, br:{x:r,y:b}, bl:{x:l,y:b} };
+  }catch(e){ return null; }
+}
+// Resolve a homografia (transformação projetiva 3x3) que mapeia os 4
+// pontos de origem para os 4 pontos de destino, via eliminação
+// gaussiana de um sistema linear 8x8 — é a mesma matemática por trás do
+// "four point transform" usado em apps de scanner.
+function resolverHomografia_(origem, destino){
+  const A = [], B = [];
+  for(let i = 0; i < 4; i++){
+    const sx = origem[i].x, sy = origem[i].y, dx = destino[i].x, dy = destino[i].y;
+    A.push([sx, sy, 1, 0, 0, 0, -sx*dx, -sy*dx]); B.push(dx);
+    A.push([0, 0, 0, sx, sy, 1, -sx*dy, -sy*dy]); B.push(dy);
+  }
+  const n = 8;
+  for(let i = 0; i < n; i++){
+    let maxRow = i;
+    for(let k = i+1; k < n; k++) if(Math.abs(A[k][i]) > Math.abs(A[maxRow][i])) maxRow = k;
+    const tmpA = A[i]; A[i] = A[maxRow]; A[maxRow] = tmpA;
+    const tmpB = B[i]; B[i] = B[maxRow]; B[maxRow] = tmpB;
+    if(Math.abs(A[i][i]) < 1e-12) continue;
+    for(let k = i+1; k < n; k++){
+      const f = A[k][i] / A[i][i];
+      for(let j = i; j < n; j++) A[k][j] -= f * A[i][j];
+      B[k] -= f * B[i];
+    }
+  }
+  const hVec = new Array(n).fill(0);
+  for(let i = n-1; i >= 0; i--){
+    let s = B[i];
+    for(let j = i+1; j < n; j++) s -= A[i][j] * hVec[j];
+    hVec[i] = Math.abs(A[i][i]) < 1e-12 ? 0 : s / A[i][i];
+  }
+  return hVec; // [a,b,c,d,e,f,g,h] da matriz 3x3 (m22 = 1)
+}
+// Aplica o recorte de perspectiva: para cada pixel do retângulo de
+// SAÍDA, calcula de onde ele vem na imagem ORIGEM (usando a homografia
+// destino->origem, que evita ter que inverter matriz) e copia a cor —
+// resultado é o documento "esticado" para um retângulo reto, como um
+// scanner de verdade faz com uma foto em ângulo.
+function aplicarTransformacaoPerspectiva_(img, cantosPixel, larguraSaida, alturaSaida){
+  const destinoRetangulo = [
+    {x:0, y:0}, {x:larguraSaida, y:0}, {x:larguraSaida, y:alturaSaida}, {x:0, y:alturaSaida}
+  ];
+  const origemCantos = [cantosPixel.tl, cantosPixel.tr, cantosPixel.br, cantosPixel.bl];
+  const m = resolverHomografia_(destinoRetangulo, origemCantos);
+  const cOrig = document.createElement('canvas');
+  cOrig.width = img.naturalWidth; cOrig.height = img.naturalHeight;
+  cOrig.getContext('2d').drawImage(img, 0, 0);
+  const dadosOrig = cOrig.getContext('2d').getImageData(0, 0, cOrig.width, cOrig.height).data;
+  const sw = cOrig.width, sh = cOrig.height;
+  const cSaida = document.createElement('canvas');
+  cSaida.width = larguraSaida; cSaida.height = alturaSaida;
+  const ctxSaida = cSaida.getContext('2d');
+  const dadosSaida = ctxSaida.createImageData(larguraSaida, alturaSaida);
+  for(let y = 0; y < alturaSaida; y++){
+    for(let x = 0; x < larguraSaida; x++){
+      const den = m[6]*x + m[7]*y + 1;
+      const sx = (m[0]*x + m[1]*y + m[2]) / den;
+      const sy = (m[3]*x + m[4]*y + m[5]) / den;
+      const ix = Math.round(sx), iy = Math.round(sy);
+      const outIdx = (y*larguraSaida + x) * 4;
+      if(ix >= 0 && ix < sw && iy >= 0 && iy < sh){
+        const inIdx = (iy*sw + ix) * 4;
+        dadosSaida.data[outIdx] = dadosOrig[inIdx];
+        dadosSaida.data[outIdx+1] = dadosOrig[inIdx+1];
+        dadosSaida.data[outIdx+2] = dadosOrig[inIdx+2];
+        dadosSaida.data[outIdx+3] = 255;
+      }else{
+        dadosSaida.data[outIdx] = 255; dadosSaida.data[outIdx+1] = 255; dadosSaida.data[outIdx+2] = 255; dadosSaida.data[outIdx+3] = 255;
+      }
+    }
+  }
+  ctxSaida.putImageData(dadosSaida, 0, 0);
+  return cSaida;
+}
 // Mesmo limite usado no upload normal (MAX_UPLOAD_BYTES no Code.gs) —
 // evita montar um PDF/lote de imagens que o servidor vai rejeitar de
 // qualquer forma depois de todo o trabalho de captura já feito. O limite
@@ -1891,10 +2066,172 @@ const CAM_MAX_BYTES = 25 * 1024 * 1024;
 const CAM_MAX_PAGINAS = 40;
 function camTamanhoBytes_(){ return camPages.reduce((soma, p) => soma + Math.round(p.length * 0.75), 0); }
 function camTamanhoFmt_(bytes){ return bytes >= 1024*1024 ? (bytes/(1024*1024)).toFixed(1)+' MB' : Math.max(1,Math.round(bytes/1024))+' KB'; }
-function modalCamera(){
-  camPages = [];
+// Adiciona uma página já processada (depois do ajuste de bordas, ou a
+// imagem inteira quando o usuário optar por pular o recorte) à lista de
+// páginas do scanner, respeitando os mesmos limites de quantidade/tamanho
+// que já existiam antes (CAM_MAX_PAGINAS / CAM_MAX_BYTES).
+function adicionarPaginaProcessada_(dataUrl){
+  if(!dataUrl) return false;
+  if(camPages.length >= CAM_MAX_PAGINAS){
+    toast('Limite de ' + CAM_MAX_PAGINAS + ' páginas por digitalização atingido — esta página não foi adicionada.', 'error');
+    return false;
+  }
+  const bytesPagina = Math.round(dataUrl.length * 0.75);
+  if(camTamanhoBytes_() + bytesPagina > CAM_MAX_BYTES){
+    toast('Esta página passaria do limite de ~' + camTamanhoFmt_(CAM_MAX_BYTES) + ' por digitalização — não foi adicionada.', 'error');
+    return false;
+  }
+  camPages.push(dataUrl);
+  return true;
+}
+// Abre a tela de ajuste de bordas para UM arquivo de imagem — detecta um
+// retângulo inicial automaticamente e deixa o usuário arrastar os 4
+// cantos para corrigir, igual ao scanner do Google Drive.
+function abrirAjusteBordas_(file){
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.onload = () => {
+    try{ URL.revokeObjectURL(url); }catch(e){}
+    ajusteImg = img;
+    ajusteCantos = detectarBordasIniciais_(img) || {tl:{x:0.04,y:0.04}, tr:{x:0.96,y:0.04}, br:{x:0.96,y:0.96}, bl:{x:0.04,y:0.96}};
+    openModal(htmlModalAjusteBordas_(img.src), 'modal-ajuste-bordas');
+    atualizarHandlesEPoligono_();
+    ativarArrastarHandles_();
+  };
+  img.onerror = () => {
+    try{ URL.revokeObjectURL(url); }catch(e){}
+    toast('Não foi possível carregar uma das imagens selecionadas.', 'error');
+    processarProximoAjuste_();
+  };
+  img.src = url;
+}
+function htmlModalAjusteBordas_(imgSrc){
+  const restantes = ajusteFila.length;
+  return '<h3><i class="fa-solid fa-crop"></i> Ajustar bordas do documento</h3>' +
+    '<p class="modal-sub">Arraste os 4 cantos para marcar exatamente as bordas do documento' + (restantes ? ' (' + restantes + ' imagem(ns) restante(s) depois desta)' : '') + '.</p>' +
+    '<div class="ajuste-bordas-wrap" id="ajusteBordasWrap">' +
+      '<img id="ajusteBordasImg" src="' + imgSrc + '" draggable="false" alt="">' +
+      '<svg id="ajusteBordasSvg" class="ajuste-bordas-svg" viewBox="0 0 100 100" preserveAspectRatio="none">' +
+        '<polygon id="ajustePoligono" class="ajuste-poligono"></polygon>' +
+        '<circle class="ajuste-handle" data-canto="tl" r="4"></circle>' +
+        '<circle class="ajuste-handle" data-canto="tr" r="4"></circle>' +
+        '<circle class="ajuste-handle" data-canto="br" r="4"></circle>' +
+        '<circle class="ajuste-handle" data-canto="bl" r="4"></circle>' +
+      '</svg>' +
+    '</div>' +
+    '<div class="modal-actions">' +
+    '<button class="btn btn-light" data-action="ajuste-cancelar-pagina"><i class="fa-solid fa-xmark"></i> Descartar esta página</button>' +
+    '<button class="btn btn-light" data-action="ajuste-pular"><i class="fa-solid fa-expand"></i> Usar imagem inteira</button>' +
+    '<button class="btn btn-primary" data-action="ajuste-confirmar"><i class="fa-solid fa-check"></i> Confirmar recorte</button>' +
+    '</div>';
+}
+function atualizarHandlesEPoligono_(){
+  const svg = document.getElementById('ajusteBordasSvg');
+  if(!svg || !ajusteCantos) return;
+  const ordem = ['tl','tr','br','bl'];
+  ordem.forEach(k => {
+    const c = ajusteCantos[k];
+    const el = svg.querySelector('.ajuste-handle[data-canto="' + k + '"]');
+    if(el){ el.setAttribute('cx', c.x*100); el.setAttribute('cy', c.y*100); }
+  });
+  const poligono = svg.querySelector('#ajustePoligono');
+  if(poligono) poligono.setAttribute('points', ordem.map(k => (ajusteCantos[k].x*100) + ',' + (ajusteCantos[k].y*100)).join(' '));
+}
+// Arrastar os cantos funciona por Pointer Events (unifica mouse e toque
+// — essencial já que este recurso é usado principalmente no celular).
+// As coordenadas são convertidas direto para percentual da área visível
+// da imagem (0–1), então funcionam independente do tamanho real de tela.
+function ativarArrastarHandles_(){
+  const svg = document.getElementById('ajusteBordasSvg');
+  const wrap = document.getElementById('ajusteBordasWrap');
+  if(!svg || !wrap) return;
+  let cantoArrastando = null;
+  function posParaRelativo_(clientX, clientY){
+    const rect = wrap.getBoundingClientRect();
+    let x = rect.width ? (clientX - rect.left) / rect.width : 0;
+    let y = rect.height ? (clientY - rect.top) / rect.height : 0;
+    return { x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)) };
+  }
+  svg.querySelectorAll('.ajuste-handle').forEach(handle => {
+    handle.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      cantoArrastando = handle.dataset.canto;
+      try{ handle.setPointerCapture(e.pointerId); }catch(err){}
+    });
+  });
+  svg.addEventListener('pointermove', e => {
+    if(!cantoArrastando || !ajusteCantos) return;
+    e.preventDefault();
+    ajusteCantos[cantoArrastando] = posParaRelativo_(e.clientX, e.clientY);
+    atualizarHandlesEPoligono_();
+  });
+  const soltar = () => { cantoArrastando = null; };
+  svg.addEventListener('pointerup', soltar);
+  svg.addEventListener('pointercancel', soltar);
+  svg.addEventListener('pointerleave', soltar);
+}
+// Finaliza a página atual da fila: aplica o recorte de perspectiva (ou
+// usa a imagem inteira, se cantosRelativos for null) e segue para a
+// próxima imagem pendente, se houver.
+function finalizarAjusteAtual_(cantosRelativos, descartar){
+  const img = ajusteImg;
+  ajusteImg = null; ajusteCantos = null;
+  if(img && !descartar){
+    let dataUrl = null;
+    try{
+      if(cantosRelativos){
+        const iw = img.naturalWidth, ih = img.naturalHeight;
+        const cantosPixel = {
+          tl: {x: cantosRelativos.tl.x*iw, y: cantosRelativos.tl.y*ih},
+          tr: {x: cantosRelativos.tr.x*iw, y: cantosRelativos.tr.y*ih},
+          br: {x: cantosRelativos.br.x*iw, y: cantosRelativos.br.y*ih},
+          bl: {x: cantosRelativos.bl.x*iw, y: cantosRelativos.bl.y*ih}
+        };
+        const larguraTopo = distanciaPontos_(cantosPixel.tl, cantosPixel.tr);
+        const larguraBase = distanciaPontos_(cantosPixel.bl, cantosPixel.br);
+        const alturaEsq = distanciaPontos_(cantosPixel.tl, cantosPixel.bl);
+        const alturaDir = distanciaPontos_(cantosPixel.tr, cantosPixel.br);
+        let larguraSaida = Math.round(Math.max(larguraTopo, larguraBase));
+        let alturaSaida = Math.round(Math.max(alturaEsq, alturaDir));
+        const maxLado = 1600;
+        const escalaTeto = Math.min(1, maxLado / Math.max(larguraSaida, alturaSaida, 1));
+        larguraSaida = Math.max(50, Math.round(larguraSaida*escalaTeto));
+        alturaSaida = Math.max(50, Math.round(alturaSaida*escalaTeto));
+        const canvasResultado = aplicarTransformacaoPerspectiva_(img, cantosPixel, larguraSaida, alturaSaida);
+        dataUrl = canvasResultado.toDataURL('image/jpeg', 0.85);
+      }else{
+        const maxDim = 1600;
+        const sc = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
+        const w = Math.round(img.naturalWidth*sc), h = Math.round(img.naturalHeight*sc);
+        const c = document.createElement('canvas'); c.width = w; c.height = h;
+        c.getContext('2d').drawImage(img, 0, 0, w, h);
+        dataUrl = c.toDataURL('image/jpeg', 0.85);
+      }
+    }catch(e){
+      toast('Não foi possível processar esta página: ' + (e && e.message || e), 'error');
+      dataUrl = null;
+    }
+    if(dataUrl) adicionarPaginaProcessada_(dataUrl);
+  }
+  processarProximoAjuste_();
+}
+// Segue para a próxima imagem da fila (seleção múltipla da galeria) ou,
+// se não houver mais nenhuma, volta para a tela de lista de páginas do
+// scanner sem perder as páginas já processadas.
+function processarProximoAjuste_(){
+  if(ajusteFila.length && camPages.length < CAM_MAX_PAGINAS){
+    abrirAjusteBordas_(ajusteFila.shift());
+    return;
+  }
+  if(ajusteFila.length){
+    toast('Limite de ' + CAM_MAX_PAGINAS + ' páginas atingido — as demais imagens selecionadas foram ignoradas.', 'info');
+    ajusteFila = [];
+  }
+  voltarParaModalCamera_();
+}
+function htmlModalCamera_(){
   const pasta = pastaPorId(state.currentFolderId);
-  openModal('<h3><i class="fa-solid fa-camera"></i> Digitalizar com a câmera</h3>' +
+  return '<h3><i class="fa-solid fa-camera"></i> Digitalizar com a câmera</h3>' +
     '<p class="modal-sub">Capture <b>uma ou várias páginas</b> pelo celular (ou adicione imagens da galeria) e salve como <b>PDF único</b> ou como imagens na pasta atual' +
     (pasta ? ' (<b>' + esc(pasta.nome) + '</b>)' : ' (Raiz)') + '. As imagens são otimizadas e enviadas ao Drive. Máximo de ' + CAM_MAX_PAGINAS + ' páginas ou ~' + camTamanhoFmt_(CAM_MAX_BYTES) + ' por digitalização.</p>' +
     '<div class="w-toolbar" style="margin-top:0">' +
@@ -1907,7 +2244,20 @@ function modalCamera(){
     '<div id="camPages" class="cam-grid"></div>' +
     '<div class="modal-actions"><button class="btn btn-light" data-action="fechar-modal">Cancelar</button>' +
     '<button class="btn btn-light" data-action="cam-save-imgs"><i class="fa-solid fa-image"></i> Salvar imagens</button>' +
-    '<button class="btn btn-primary" data-action="cam-save-pdf"><i class="fa-solid fa-file-pdf"></i> Salvar como PDF</button></div>');
+    '<button class="btn btn-primary" data-action="cam-save-pdf"><i class="fa-solid fa-file-pdf"></i> Salvar como PDF</button></div>';
+}
+function modalCamera(){
+  camPages = [];
+  openModal(htmlModalCamera_());
+  renderCamPages();
+}
+// Volta para a tela de lista de páginas do scanner SEM zerar camPages —
+// diferente de chamar modalCamera() de novo (que reinicia a
+// digitalização do zero) ou fecharModal() (que também zera camPages).
+// Usado pelo fluxo de ajuste de bordas para retornar entre uma página e
+// outra da fila, preservando as páginas já processadas.
+function voltarParaModalCamera_(){
+  openModal(htmlModalCamera_());
   renderCamPages();
 }
 function renderCamPages(){
@@ -1989,7 +2339,7 @@ function enviarArquivoAoDrive_(doc){
 }
 
 
-function salvarDocArquivo(base, dataUrl){
+async function salvarDocArquivo(base, dataUrl){
   const tamanho = Math.round(dataUrl.length * 0.75);
   const docs = DB.get('Documentos');
   const doc = Object.assign({}, base, {arquivo: dataUrl, tamanho});
@@ -2002,18 +2352,24 @@ function salvarDocArquivo(base, dataUrl){
   // que permite ao lote de upload esperar um arquivo terminar antes de
   // começar o próximo, em vez de disparar tudo de uma vez.
   const pUpload = Sync.url() ? Promise.resolve(pPush).then(() => enviarArquivoAoDrive_(doc)) : Promise.resolve({ok:true});
-  return Promise.resolve(pUpload).then(res => {
-    const ok = (res && res.ok) !== false;
-    // Aplica o driveId/driveUrl já retornados pelo servidor direto no
-    // cache local assim que o upload termina de verdade — sem isso, o
-    // total de arquivos e a lista só refletiam o envio depois que uma
-    // sincronização em segundo plano confirmasse (podendo levar alguns
-    // segundos após um lote/reenvio terminar).
-    if(ok && res && res.res && res.res.driveId){
-      DB.set('Documentos', DB.get('Documentos').map(x => x.id === doc.id ? Object.assign({}, x, {driveId: res.res.driveId, driveUrl: res.res.driveUrl || '', arquivo:'', erroUpload:''}) : x));
-    }
-    return ok;
-  });
+  const res = await pUpload;
+  let ok = (res && res.ok) !== false;
+  // ITEM (falso negativo em conexão de celular lenta/instável): se o
+  // cliente desistiu por timeout (ver postApi_) mas o servidor pode ter
+  // terminado o envio um pouco depois, confirma diretamente com o
+  // servidor antes de desistir de vez — mesmo mecanismo de segurança já
+  // usado no upload em lote (handleUploadComTimeout_), agora reaproveitado
+  // aqui para cobrir também a digitalização por câmera e a galeria.
+  if(!ok && Sync.url()) ok = await verificarUploadConfirmadoNoServidor_(doc.id);
+  // Aplica o driveId/driveUrl já retornados pelo servidor direto no
+  // cache local assim que o upload termina de verdade — sem isso, o
+  // total de arquivos e a lista só refletiam o envio depois que uma
+  // sincronização em segundo plano confirmasse (podendo levar alguns
+  // segundos após um lote/reenvio terminar).
+  if(ok && res && res.res && res.res.driveId){
+    DB.set('Documentos', DB.get('Documentos').map(x => x.id === doc.id ? Object.assign({}, x, {driveId: res.res.driveId, driveUrl: res.res.driveUrl || '', arquivo:'', erroUpload:''}) : x));
+  }
+  return ok;
 }
 
 
@@ -4465,6 +4821,15 @@ document.addEventListener('click', e => {
       camPages.splice(Number(el.dataset.idx), 1);
       renderCamPages();
       break;
+    case 'ajuste-confirmar':
+      finalizarAjusteAtual_(ajusteCantos, false);
+      break;
+    case 'ajuste-pular':
+      finalizarAjusteAtual_(null, false);
+      break;
+    case 'ajuste-cancelar-pagina':
+      finalizarAjusteAtual_(null, true);
+      break;
     case 'cam-save-pdf': {
       if(!camPages.length){ toast('Capture ao menos uma página.','error'); break; }
       if(!permsAtuais().includes('upload')){ toast('Sem permissão de upload nesta pasta.','error'); break; }
@@ -4869,13 +5234,20 @@ document.addEventListener('click', e => {
     }
     case 'salvar-permissoes': {
       let perms = DB.get('Permissoes');
+      const idsRemovidos = [];
       $$('#modalCard .prow').forEach(row => {
         const userId = row.dataset.user;
         let conjunto = $$('.ptog.on', row).map(b => b.dataset.perm);
         if(conjunto.length && !conjunto.includes('visualizar')) conjunto.unshift('visualizar');
+        // Marca explicitamente os ids das permissões antigas removidas
+        // aqui (ver DB.set / tombstones) — sem isso, a proteção contra
+        // cache local incompleto trataria essa remoção como "ausência
+        // não intencional" e a preservaria no servidor em vez de excluir.
+        perms.filter(pp => pp.pastaId === id && pp.userId === userId).forEach(pp => idsRemovidos.push(pp.id));
         perms = perms.filter(pp => !(pp.pastaId === id && pp.userId === userId));
         if(conjunto.length) perms.push({id: uid('p'), pastaId: id, userId: userId, perms: conjunto});
       });
+      if(idsRemovidos.length) marcarExcluido_('Permissoes', idsRemovidos);
       DB.set('Permissoes', perms); fecharModal(); toast('Permissões da pasta atualizadas e sincronizadas.'); renderDashboard(); break;
     }
     case 'novo-usuario':
@@ -4961,25 +5333,19 @@ document.addEventListener('change', e => {
     e.target.value = '';
     if(!files.length) return;
     if(camPages.length >= CAM_MAX_PAGINAS){ toast('Limite de ' + CAM_MAX_PAGINAS + ' páginas por digitalização atingido.','error'); return; }
-    toast('Processando imagem(ns)…','info');
-    Promise.all(files.map(f => fileToJpegDataUrl(f))).then(pages => {
-      // ITEM 9: aplica os limites de páginas/tamanho (mesmo teto de 25 MiB
-      // do upload normal, MAX_UPLOAD_BYTES no Code.gs) já na hora de
-      // adicionar, para não deixar a pessoa montar uma digitalização que o
-      // servidor vai recusar de qualquer forma só depois de tudo pronto.
-      let bytesAtuais = camTamanhoBytes_();
-      let aceitas = 0, recusadasTamanho = 0, recusadasLimite = 0;
-      pages.forEach(p => {
-        if(camPages.length >= CAM_MAX_PAGINAS){ recusadasLimite++; return; }
-        const bytesPagina = Math.round(p.length * 0.75);
-        if(bytesAtuais + bytesPagina > CAM_MAX_BYTES){ recusadasTamanho++; return; }
-        camPages.push(p); bytesAtuais += bytesPagina; aceitas++;
-      });
-      renderCamPages();
-      if(aceitas) toast(aceitas + ' página(s) adicionada(s).');
-      if(recusadasLimite) toast(recusadasLimite + ' página(s) não adicionada(s): limite de ' + CAM_MAX_PAGINAS + ' páginas atingido.','error');
-      if(recusadasTamanho) toast(recusadasTamanho + ' página(s) não adicionada(s): passaria do limite de ~' + camTamanhoFmt_(CAM_MAX_BYTES) + '.','error');
-    }).catch(() => toast('Não foi possível processar a imagem.','error'));
+    // ITEM (seleção automática das bordas do documento, como no scanner
+    // do Google Drive): cada imagem (foto da câmera ou da galeria) passa
+    // pela tela de ajuste de bordas — detecção automática inicial +
+    // arraste dos 4 cantos para corrigir — antes de virar página, em vez
+    // de usar a foto/imagem inteira direto como antes. Para seleção
+    // múltipla da galeria, as imagens entram numa fila e são processadas
+    // uma de cada vez (ver processarProximoAjuste_).
+    const vagas = Math.max(0, CAM_MAX_PAGINAS - camPages.length);
+    ajusteFila = files.slice(0, vagas);
+    if(files.length > ajusteFila.length){
+      toast('Só ' + ajusteFila.length + ' imagem(ns) cabem no limite de ' + CAM_MAX_PAGINAS + ' páginas — o restante foi ignorado.', 'info');
+    }
+    processarProximoAjuste_();
     return;
   }
   if(e.target.id === 'logoInput'){
